@@ -173,7 +173,57 @@ const ToolbarButton = ({ icon, onClick, label }) => (
   </button>
 );
 
+// --- LOGIQUE DE GESTION DU SYSTÈME DE FICHIERS ---
+const fileSystemUtils = {
+  findNode: (root, path) => {
+    let current = root;
+    for (let i = 1; i < path.length; i++) {
+      current = current.children?.find(c => c.name === path[i]);
+      if (!current) return null;
+    }
+    return current;
+  },
+
+  updateNode: (root, path, updates) => {
+    const newRoot = JSON.parse(JSON.stringify(root));
+    let current = newRoot;
+    for (let i = 1; i < path.length - 1; i++) {
+      current = current.children.find(c => c.name === path[i]);
+    }
+    const target = current.children.find(c => c.name === path[path.length - 1]);
+    Object.assign(target, updates);
+    return newRoot;
+  },
+
+  removeNode: (root, path) => {
+    const newRoot = JSON.parse(JSON.stringify(root));
+    let current = newRoot;
+    for (let i = 1; i < path.length - 1; i++) {
+      current = current.children.find(c => c.name === path[i]);
+    }
+    const name = path[path.length - 1];
+    current.children = current.children.filter(c => c.name !== name);
+    return newRoot;
+  },
+
+  insertNode: (root, path, node) => {
+    const newRoot = JSON.parse(JSON.stringify(root));
+    const target = fileSystemUtils.findNode(newRoot, path);
+    if (target) {
+      if (!target.children) target.children = [];
+      target.children.push(node);
+    }
+    return newRoot;
+  }
+};
+
 export default function App() {
+  // --- ÉTAT DU SYSTÈME DE FICHIERS ---
+  const [fileSystem, setFileSystem] = useState(() => {
+    const saved = localStorage.getItem('mc_filesystem');
+    return saved ? JSON.parse(saved) : { name: "Root", type: "folder", children: [] };
+  });
+
   const [projects, setProjects] = useState([]); 
   const [activeProjectId, setActiveProjectId] = useState(null);
   const [search, setSearch] = useState("");
@@ -184,6 +234,11 @@ export default function App() {
 
   const editorRef = useRef(null);
   const activeProject = projects.find(p => p.id === activeProjectId);
+
+  // --- SAUVEGARDE AUTOMATIQUE DU FS ---
+  useEffect(() => {
+    localStorage.setItem('mc_filesystem', JSON.stringify(fileSystem));
+  }, [fileSystem]);
 
   const exec = (command, value = null) => {
     if (editorRef.current) editorRef.current.focus();
@@ -241,23 +296,42 @@ export default function App() {
     }
   };
 
+  const toggleSort = (key) => {
+    setSortConfig(prev => ({ 
+      key, 
+      direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' 
+    }));
+  };
+
+
   const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
     const isNbt = file.name.toLowerCase().endsWith('.nbt');
+    
     reader.onload = async (event) => {
       try {
         const results = isNbt ? await parseNbtToMaterials(event.target.result) : parseTxtToMaterials(event.target.result);
         const newId = Date.now();
-        setProjects(prev => [...prev, { id: newId, name: file.name.replace(/\.[^/.]+$/, ""), data: results, history: [] }]);
+        const projectName = file.name.replace(/\.[^/.]+$/, "");
+
+        // 1. Création du projet
+        setProjects(prev => [...prev, { id: newId, name: projectName, data: results, history: [] }]);
         setActiveProjectId(newId);
+
+        // 2. AJOUT DANS L'EXPLORATEUR
+        setFileSystem(prev => ({
+          ...prev,
+          children: [...prev.children, { name: projectName, type: 'file', projectId: newId }]
+        }));
+
       } catch (err) { alert("Error: " + err.message); }
     };
     if (isNbt) reader.readAsArrayBuffer(file); else reader.readAsText(file);
     e.target.value = null;
   };
-
+  
   const updateActiveData = (newData, newHistory = null) => {
     setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, data: newData, history: newHistory || p.history } : p));
   };
@@ -285,56 +359,227 @@ export default function App() {
     updateActiveData(newData, activeProject.history.slice(0, -1));
   };
 
+  // --- ZONE LOGIQUE SYSTÈME DE FICHIERS ---
+
+  const addFolder = () => {
+    const name = prompt("Nom du dossier :");
+    if (!name) return;
+    setFileSystem(prev => ({
+      ...prev,
+      children: [...(prev.children || []), { name, type: 'folder', isOpen: true, children: [] }]
+    }));
+  };
+
+  const moveNode = (fromPath, toPath) => {
+    setFileSystem(prev => {
+      const nodeToMove = getNodeByPath(prev, fromPath);
+      const afterDelete = removeNode(prev, fromPath);
+      return addNodeToPath(afterDelete, toPath, nodeToMove);
+    });
+  };
+
+  const deleteNode = (path) => {
+    if (confirm("Êtes-vous sûr de vouloir supprimer cet élément ?")) {
+      setFileSystem(prev => fileSystemUtils.removeNode(prev, path));
+    }
+  };
+
+  const handleDrop = (e, targetNode, targetPath) => {
+    e.stopPropagation();
+    const draggedPath = JSON.parse(e.dataTransfer.getData("path"));
+    
+    // On ne déplace pas un dossier dans lui-même
+    if (JSON.stringify(draggedPath) === JSON.stringify(targetPath)) return;
+
+    setFileSystem(prev => {
+      // 1. Extraire le nœud déplacé
+      const nodeToMove = getNodeByPath(prev, draggedPath);
+      // 2. Supprimer le nœud de son ancienne place
+      const withoutNode = removeNode(prev, draggedPath);
+      // 3. Ajouter le nœud à sa nouvelle place
+      return addNodeToParent(withoutNode, targetPath, nodeToMove);
+    });
+  };
+
   const sortedMaterials = useMemo(() => {
     if (!activeProject) return [];
     let items = [...activeProject.data.filter(m => m.name.toLowerCase().includes(search.toLowerCase()))];
+    
     if (sortConfig.key) {
       items.sort((a, b) => {
         let aV = a[sortConfig.key], bV = b[sortConfig.key];
+        // Tri spécifique si c'est du texte (nom) ou numérique (total/done)
+        if (typeof aV === 'string') {
+          return sortConfig.direction === 'asc' ? aV.localeCompare(bV) : bV.localeCompare(aV);
+        }
         return sortConfig.direction === 'asc' ? (aV > bV ? 1 : -1) : (aV < bV ? 1 : -1);
       });
     }
     return items;
   }, [activeProject, sortConfig, search]);
 
+  const updateNode = (node, path, updates) => {
+    if (path.length === 1 && node.name === path[0]) {
+      return { ...node, ...updates };
+    }
+    if (node.children) {
+      return {
+        ...node,
+        children: node.children.map(child => 
+          child.name === path[1] ? updateNode(child, path.slice(1), updates) : child
+        )
+      };
+    }
+    return node;
+  };
+
+  const renderFileSystem = (node, path = []) => {
+    const isFolder = node.type === 'folder';
+    const currentPath = [...path, node.name];
+
+    // Gérer l'ouverture/fermeture
+    const toggleFolder = (e) => {
+      e.stopPropagation();
+      setFileSystem(prev => updateNode(prev, currentPath, { isOpen: !node.isOpen }));
+    };
+
+    // Gérer le renommage
+    const renameNode = (e) => {
+      e.preventDefault();
+      const newName = prompt("Nouveau nom :", node.name);
+      if (newName && newName !== node.name) {
+        setFileSystem(prev => updateNode(prev, currentPath, { name: newName }));
+      }
+    };
+
+    // --- LOGIQUE DRAG & DROP ---
+    const handleDragStart = (e) => {
+      e.stopPropagation();
+      e.dataTransfer.setData("draggedPath", JSON.stringify(currentPath));
+    };
+
+    const handleDrop = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!isFolder) return; // On ne peut déposer que dans un dossier
+      
+      const draggedPath = JSON.parse(e.dataTransfer.getData("draggedPath"));
+      if (JSON.stringify(draggedPath) === JSON.stringify(currentPath)) return;
+
+      // Déclenche le déplacement dans ton état global
+      moveNode(draggedPath, currentPath);
+    };
+    
+    const addFolder = () => {
+      const name = prompt("Nom du dossier :");
+      if (!name) return;
+      setFileSystem(prev => ({
+        ...prev,
+        children: [...(prev.children || []), { name, type: 'folder', isOpen: true, children: [] }]
+      }));
+    };
+
+    const moveNode = (fromPath, toPath) => {
+      setFileSystem(prev => {
+        const node = fileSystemUtils.findNode(prev, fromPath);
+        const without = fileSystemUtils.removeNode(prev, fromPath);
+        return fileSystemUtils.insertNode(without, toPath, node);
+      });
+    };
+
+    const handleDoubleClick = (e, node, path) => {
+      e.stopPropagation();
+      const newName = prompt("Nouveau nom :", node.name);
+      if (newName && newName !== node.name) {
+        setFileSystem(prev => fileSystemUtils.updateNode(prev, path, { name: newName }));
+      }
+    };
+
+    return (
+      <div 
+        key={node.name} 
+        className="select-none"
+        draggable={true}
+        onDragStart={handleDragStart}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={handleDrop}
+      >
+        <div 
+          className="flex items-center gap-2 py-1.5 px-2 cursor-pointer hover:bg-[#2d2d2d] rounded focus:bg-[#37373d]" 
+          onClick={isFolder ? toggleFolder : () => node.projectId && setActiveProjectId(node.projectId)}
+          onDoubleClick={(e) => handleDoubleClick(e, node, currentPath)}
+        >
+          <span>{isFolder ? (node.isOpen ? "📂" : "📁") : "📄"}</span>
+          <span className="truncate">{node.name}</span>
+        </div>
+        
+        {isFolder && node.isOpen && Array.isArray(node.children) && (
+        <div className="ml-4 border-l border-[#333] pl-2">
+          {node.children.map(child => renderFileSystem(child, currentPath))}
+        </div>
+      )}
+      </div>
+    );
+  };
+
   return (
-    <div className="min-h-screen bg-[#1e1e1e] text-[#d4d4d4] font-sans pb-32">
+  <div className="flex min-h-screen bg-[#1e1e1e] text-[#d4d4d4] font-sans">
+    {/* --- EXPLORATEUR --- */}
+    <aside className="w-64 bg-[#181818] border-r border-[#333] p-6 flex flex-col">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-[#569cd6] font-bold text-xs uppercase tracking-widest">Explorer</h2>
+        <div className="flex gap-3">
+          {/* C'est ici que tu appelles la fonction addFolder */}
+          <Plus 
+            size={16} 
+            className="cursor-pointer hover:text-white text-gray-500" 
+            onClick={addFolder} 
+            title="Ajouter dossier" 
+          />
+        </div>
+      </div>
+      
+      <div className="flex-1 overflow-y-auto custom-scrollbar">
+        {renderFileSystem(fileSystem)}
+      </div>
+    </aside>
+
+    {/* --- CONTENU PRINCIPAL --- */}
+    <main className="flex-1 pb-32">
       {showCalc && <MinecraftCalculator onAddMaterial={addManualMaterial} onClose={() => setShowCalc(false)} />}
 
       <div className="max-w-6xl mx-auto p-4 md:p-10">
-        
-      <header className="relative flex justify-between items-center mb-6 select-none">
-        <h1 className="text-3xl font-black text-white tracking-tighter flex items-center gap-3">
-          <ListChecks className="text-[#569cd6]" size={32} /> PROJECT MANAGER
-        </h1>
-        
-        <div className="flex items-center gap-3 pr-16"> 
-          {activeProject?.history?.length > 0 && viewMode === 'materials' && (
-            <button 
-              onClick={undoDelete} 
-              className="flex items-center gap-2 px-4 py-2 bg-[#37373d] text-[#569cd6] rounded-xl font-bold border border-[#569cd6]/30 hover:bg-[#45454d] animate-in fade-in zoom-in-95 duration-200"
-            >
-              <Undo2 size={18} /> UNDO
-            </button>
-          )}
+        <header className="relative flex justify-between items-center mb-6 select-none">
+          <h1 className="text-3xl font-black text-white tracking-tighter flex items-center gap-3">
+            <ListChecks className="text-[#569cd6]" size={32} /> PROJECT MANAGER
+          </h1>
 
-          <label className="cursor-pointer bg-[#569cd6] hover:bg-[#4a86b8] text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg transition-all">
-            <Plus size={20}/> NEW PROJECT
-            <input type="file" className="hidden" onChange={handleFileUpload} accept=".nbt,.txt" />
-          </label>
-        </div>
+          <div className="flex items-center gap-3 pr-16">
+            {activeProject?.history?.length > 0 && viewMode === 'materials' && (
+              <button
+                onClick={undoDelete}
+                className="flex items-center gap-2 px-4 py-2 bg-[#37373d] text-[#569cd6] rounded-xl font-bold border border-[#569cd6]/30 hover:bg-[#45454d] animate-in fade-in zoom-in-95 duration-200"
+              >
+                <Undo2 size={18} /> UNDO
+              </button>
+            )}
 
-        <button 
-          onClick={() => setShowCalc(!showCalc)} 
-          className={`absolute top-0 right-0 p-3 rounded-xl font-bold border transition-all z-50 ${
-            showCalc 
-            ? 'bg-[#569cd6] text-white border-[#569cd6] shadow-[0_0_15px_rgba(86,156,214,0.4)]' 
-            : 'bg-[#252526] text-gray-400 border-[#444] hover:border-[#569cd6] hover:text-white'
-          }`}
-        >
-          <Calculator size={20} />
-        </button>
-      </header>
+            <label className="cursor-pointer bg-[#569cd6] hover:bg-[#4a86b8] text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg transition-all">
+              <Plus size={20} /> NEW PROJECT
+              <input type="file" className="hidden" onChange={handleFileUpload} accept=".nbt,.txt" />
+            </label>
+          </div>
+
+          <button
+            onClick={() => setShowCalc(!showCalc)}
+            className={`absolute top-0 right-0 p-3 rounded-xl font-bold border transition-all z-50 ${showCalc
+              ? 'bg-[#569cd6] text-white border-[#569cd6] shadow-[0_0_15px_rgba(86,156,214,0.4)]'
+              : 'bg-[#252526] text-gray-400 border-[#444] hover:border-[#569cd6] hover:text-white'
+              }`}
+          >
+            <Calculator size={20} />
+          </button>
+        </header>
 
         {/* TABS */}
         <div className="flex items-center gap-1 mb-6 overflow-x-auto no-scrollbar border-b border-[#333] select-none">
@@ -362,22 +607,28 @@ export default function App() {
               </div>
               <div className="bg-[#252526] border border-[#333] rounded-3xl overflow-hidden shadow-2xl">
                 <table className="w-full text-left">
-                  <thead className="bg-[#1e1e1e]/50 text-gray-500 text-[10px] font-black uppercase tracking-widest">
+                  <thead className="bg-[#1e1e1e]/50 text-gray-500 text-[10px] font-black uppercase tracking-widest cursor-pointer select-none">
                     <tr>
-                        <th className="p-5 w-16 text-center text-white">Done</th>
-                        <th className="p-5">Item Name</th>
-                        <th className="p-5 text-right">Qty</th>
-                        <th className="p-5 text-right">Logistics</th>
-                        <th className="p-5 w-16 text-center">Action</th>
+                      <th className="p-5 w-16 text-center" onClick={() => toggleSort('done')}>
+                        Done {sortConfig.key === 'done' ? (sortConfig.direction === 'asc' ? '▲' : '▼') : ''}
+                      </th>
+                      <th className="p-5" onClick={() => toggleSort('name')}>
+                        Item Name {sortConfig.key === 'name' ? (sortConfig.direction === 'asc' ? '▲' : '▼') : ''}
+                      </th>
+                      <th className="p-5 text-right" onClick={() => toggleSort('total')}>
+                        Qty {sortConfig.key === 'total' ? (sortConfig.direction === 'asc' ? '▲' : '▼') : ''}
+                      </th>
+                      <th className="p-5 text-right">Logistics</th>
+                      <th className="p-5 w-16 text-center">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#333]">
                     {sortedMaterials.map((m) => (
                       <tr key={m.id} className={`group ${m.done ? 'opacity-50' : ''}`}>
-                        <td className="p-5 text-center"><input type="checkbox" checked={m.done} onChange={() => updateActiveData(activeProject.data.map(i => i.id === m.id ? {...i, done: !i.done} : i))} className="w-5 h-5 accent-[#569cd6]" /></td>
+                        <td className="p-5 text-center"><input type="checkbox" checked={m.done} onChange={() => updateActiveData(activeProject.data.map(i => i.id === m.id ? { ...i, done: !i.done } : i))} className="w-5 h-5 accent-[#569cd6]" /></td>
                         <td className="p-5 font-bold text-white">{m.name}</td>
                         <td className="p-5 text-right text-[#ce9178]">{m.total}</td>
-                        <td className="p-5 text-right text-gray-500">{Math.floor(m.total/64)} STACKS + {m.total%64}</td>
+                        <td className="p-5 text-right text-gray-500">{Math.floor(m.total / 64)} STACKS + {m.total % 64}</td>
                         <td className="p-5 text-center"><button onClick={() => deleteItem(m.id)}><Trash2 size={18} /></button></td>
                       </tr>
                     ))}
@@ -393,27 +644,19 @@ export default function App() {
           <div className="flex flex-col bg-[#252526] rounded-3xl border border-[#333] overflow-visible shadow-2xl relative">
             <div className="flex flex-wrap items-center gap-1 p-3 bg-[#1e1e1e] border-b border-[#333] rounded-t-3xl z-[100]">
               <div className="flex bg-[#2d2d2d] rounded-lg p-1 mr-2 border border-[#444]">
-                <ToolbarButton icon={<Bold size={18}/>} label="Bold" onClick={() => exec('bold')} />
-                <ToolbarButton icon={<Underline size={18}/>} label="Underline" onClick={() => exec('underline')} />
+                <ToolbarButton icon={<Bold size={18} />} label="Bold" onClick={() => exec('bold')} />
+                <ToolbarButton icon={<Underline size={18} />} label="Underline" onClick={() => exec('underline')} />
               </div>
-
               <div className="flex items-center bg-[#2d2d2d] rounded-lg p-1 mr-2 border border-[#444] px-3 gap-2">
                 <Type size={14} className="text-gray-500" />
-                <select 
-                  id="font-size-select" 
-                  className="bg-transparent text-xs font-black text-[#569cd6] outline-none cursor-pointer" 
-                  onChange={(e) => exec('fontSize', e.target.value)} 
-                  defaultValue="3"
-                >
-                  {[12, 14, 16, 18, 24, 30, 36, 48].map((s, i) => <option key={s} value={i+1}>{s}px</option>)}
+                <select id="font-size-select" className="bg-transparent text-xs font-black text-[#569cd6] outline-none cursor-pointer" onChange={(e) => exec('fontSize', e.target.value)} defaultValue="3">
+                  {[12, 14, 16, 18, 24, 30, 36, 48].map((s, i) => <option key={s} value={i + 1}>{s}px</option>)}
                 </select>
               </div>
-
               <div className="flex bg-[#2d2d2d] rounded-lg p-1 mr-2 border border-[#444]">
-                <ToolbarButton icon={<List size={18}/>} label="Bullet List" onClick={addBulletPoint} />
-                <ToolbarButton icon={<ExternalLink size={18}/>} label="Project Link" onClick={() => {}} />
+                <ToolbarButton icon={<List size={18} />} label="Bullet List" onClick={addBulletPoint} />
+                <ToolbarButton icon={<ExternalLink size={18} />} label="Project Link" onClick={() => { }} />
               </div>
-
               <div className="flex bg-[#2d2d2d] rounded-lg p-1 gap-1 border border-[#444] items-center px-2">
                 {['#ffffff', '#ff4d4d', '#4ade80', '#569cd6', '#ffd33d'].map(c => (
                   <button key={c} className="w-4 h-4 rounded-sm hover:scale-125 transition-transform" style={{ backgroundColor: c }} onClick={() => exec('foreColor', c)} />
@@ -421,7 +664,7 @@ export default function App() {
                 <div className="w-[1px] h-4 bg-[#444] mx-1"></div>
                 {customColors.map((color, i) => (
                   <div key={i} className="relative group flex items-center">
-                    <button className="w-5 h-5 rounded border border-white/20 transition-transform hover:scale-110" style={{ backgroundColor: color }} 
+                    <button className="w-5 h-5 rounded border border-white/20 transition-transform hover:scale-110" style={{ backgroundColor: color }}
                       onClick={() => exec('foreColor', color)}
                       onContextMenu={(e) => { e.preventDefault(); e.target.nextSibling.click(); }}
                     />
@@ -435,19 +678,12 @@ export default function App() {
                 ))}
               </div>
             </div>
-
-            <div 
-              ref={editorRef}
-              contentEditable
-              onKeyDown={handleKeyDown}
-              className="p-10 outline-none min-h-[600px] text-white bg-[#252526] rounded-b-3xl z-10 whitespace-pre-wrap"
-              style={{ lineHeight: '1.6' }}
-            >
-              <div><br/></div>
+            <div ref={editorRef} contentEditable onKeyDown={handleKeyDown} className="p-10 outline-none min-h-[600px] text-white bg-[#252526] rounded-b-3xl z-10 whitespace-pre-wrap" style={{ lineHeight: '1.6' }}>
+              <div><br /></div>
             </div>
           </div>
         )}
       </div>
-    </div>
-  );
+    </main>
+  </div>  );
 }
